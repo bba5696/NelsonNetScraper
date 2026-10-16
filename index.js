@@ -11,12 +11,22 @@ const EMAIL = process.env.NELSON_EMAIL;
 const PASSWORD = process.env.NELSON_PASSWORD;
 const API_KEY = process.env.API_KEY;
 
+const LOGIN_URL = 'https://nelsondigital.cengage.com.au/login';
+const BOOKSHELF_URL = 'https://nelsondigital.cengage.com.au/my-bookshelf';
+const USER_SEL = '#defaultControl_ctl00_place34_ctl00_PreLoginUserName';
+const PASS_SEL = '#defaultControl_ctl00_place34_ctl00_Password';
+const BOOK_SEL = '.slideUpBlock.entitlement';
+
 // Bookshelf is cached to disk so we only re-scrape when stale. Two TTLs:
 // the book LIST barely changes, but the ebook LINKS are tokens that expire
 // ~1h, so they get a much shorter lifetime (stay well under the hour).
 const CACHE_FILE = path.join(__dirname, 'cache.json');
 const BOOKS_TTL_MS = Number(process.env.BOOKS_TTL_MS) || 1000 * 60 * 60 * 6; // 6 hours
 const LINKS_TTL_MS = Number(process.env.LINKS_TTL_MS) || 1000 * 60 * 30;     // 30 minutes
+
+// Saved login session (cookies). Reused across restarts so we skip the slow
+// email/password/SSO login whenever the session is still valid.
+const SESSION_FILE = path.join(__dirname, 'session.json');
 
 let browser = null;
 let page = null;
@@ -26,7 +36,7 @@ let refreshPromise = null;  // dedupes concurrent scrapes
 let cache = null;           // { timestamp, books, links }
 
 // ---------------------------------------------------------------------------
-// Disk cache
+// Disk cache (scraped data)
 // ---------------------------------------------------------------------------
 function loadCache() {
     try {
@@ -51,42 +61,97 @@ function cacheAge() {
 }
 
 // ---------------------------------------------------------------------------
-// Login (lazy + deduplicated — only runs when we actually need the browser)
+// Session cookies (persisted across restarts)
 // ---------------------------------------------------------------------------
-async function doLogin() {
-    console.log('Logging in...');
+async function saveCookies() {
+    try {
+        const client = await page.target().createCDPSession();
+        const { cookies } = await client.send('Network.getAllCookies');
+        fs.writeFileSync(SESSION_FILE, JSON.stringify(cookies));
+    } catch (e) {
+        console.error('Failed to save session:', e.message);
+    }
+}
 
-    if (browser) await browser.close().catch(() => {});
+async function loadCookies() {
+    try {
+        const cookies = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+        if (Array.isArray(cookies) && cookies.length) {
+            await page.setCookie(...cookies);
+            return true;
+        }
+    } catch { /* no saved session yet */ }
+    return false;
+}
 
+// ---------------------------------------------------------------------------
+// Browser lifecycle. We launch on demand and close after each scrape so the
+// process idles at ~50MB instead of keeping headless Chromium (~0.7GB) resident
+// — important on a small (1GB) server.
+// ---------------------------------------------------------------------------
+async function launchBrowser() {
+    if (browser) return;
     browser = await puppeteer.launch({
         headless: 'new',
         args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
-
     page = await browser.newPage();
 
-    await page.goto('https://nelsondigital.cengage.com.au/login', {
-        waitUntil: 'networkidle2'
+    // Skip heavy assets we never read — faster navigations, smaller memory spike.
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+        const type = req.resourceType();
+        if (type === 'image' || type === 'media' || type === 'font') req.abort();
+        else req.continue();
     });
-
-    await page.waitForSelector('#defaultControl_ctl00_place34_ctl00_PreLoginUserName');
-    await page.type('#defaultControl_ctl00_place34_ctl00_PreLoginUserName', EMAIL);
-    await page.keyboard.press('Enter');
-
-    await page.waitForSelector('#defaultControl_ctl00_place34_ctl00_Password', { timeout: 10000 });
-    await page.type('#defaultControl_ctl00_place34_ctl00_Password', PASSWORD);
-    await page.keyboard.press('Enter');
-
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
-
-    isLoggedIn = true;
-    console.log('Logged in successfully!');
 }
 
-function ensureLoggedIn() {
+async function closeBrowser() {
+    if (browser) await browser.close().catch(() => {});
+    browser = null;
+    page = null;
+    isLoggedIn = false;
+}
+
+// ---------------------------------------------------------------------------
+// Login. Full credential login is the slow path and only runs when there's no
+// valid saved session. Navigations that follow the SSO redirects keep the
+// robust networkidle2 wait; the frequent bookshelf scrape uses targeted waits.
+// ---------------------------------------------------------------------------
+async function doLogin() {
+    console.log('Logging in with credentials...');
+
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
+
+    await page.waitForSelector(USER_SEL);
+    await page.type(USER_SEL, EMAIL);
+    await page.keyboard.press('Enter');
+
+    await page.waitForSelector(PASS_SEL, { timeout: 10000 });
+    await page.type(PASS_SEL, PASSWORD);
+    await page.keyboard.press('Enter');
+
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 });
+
+    await saveCookies();
+    isLoggedIn = true;
+    console.log('Logged in; session saved.');
+}
+
+// Make sure we have a browser with a (hopefully) authenticated page. Reuses the
+// saved cookies when present; falls back to a full login otherwise.
+function ensureSession() {
     if (isLoggedIn) return Promise.resolve();
     if (!loginPromise) {
-        loginPromise = doLogin()
+        loginPromise = (async () => {
+            await launchBrowser();
+            if (await loadCookies()) {
+                isLoggedIn = true; // provisional — verified when we hit the bookshelf
+                console.log('Loaded saved session (will log in only if it expired).');
+            } else {
+                await doLogin();
+            }
+        })()
             .catch(err => { isLoggedIn = false; throw err; })
             .finally(() => { loginPromise = null; });
     }
@@ -94,29 +159,27 @@ function ensureLoggedIn() {
 }
 
 // ---------------------------------------------------------------------------
-// Scrape the bookshelf. Grabs both the book list and the ebook links in a
-// single page visit, then caches them to disk.
+// Scrape the bookshelf: book list + ebook links in one visit, then cache and
+// close the browser.
 // ---------------------------------------------------------------------------
 async function scrapeBookshelf() {
-    await ensureLoggedIn();
+    await ensureSession();
 
-    await page.goto('https://nelsondigital.cengage.com.au/my-bookshelf', {
-        waitUntil: 'networkidle2'
-    });
+    await page.goto(BOOKSHELF_URL, { waitUntil: 'domcontentloaded' });
 
-    // Check if we got redirected to login (session expired)
+    // Saved session expired (bounced to login) — do a full login and retry once.
     if (page.url().includes('/login')) {
-        console.log('Session expired, re-logging in...');
+        console.log('Saved session expired, logging in fresh...');
         isLoggedIn = false;
-        await ensureLoggedIn();
-        await page.goto('https://nelsondigital.cengage.com.au/my-bookshelf', {
-            waitUntil: 'networkidle2'
-        });
+        await doLogin();
+        await page.goto(BOOKSHELF_URL, { waitUntil: 'domcontentloaded' });
     }
 
-    const data = await page.evaluate(() => {
+    await page.waitForSelector(BOOK_SEL, { timeout: 20000 });
+
+    const data = await page.evaluate((bookSel) => {
         // books[].index = position among ALL entitlement containers (unchanged)
-        const containers = document.querySelectorAll('.slideUpBlock.entitlement');
+        const containers = document.querySelectorAll(bookSel);
         const books = Array.from(containers)
             .map((container, i) => {
                 const img = container.querySelector('img.book-item-image');
@@ -131,11 +194,14 @@ async function scrapeBookshelf() {
             .map(a => a.href);
 
         return { books, links };
-    });
+    }, BOOK_SEL);
 
     cache = { timestamp: Date.now(), books: data.books, links: data.links };
     saveCache();
     console.log(`Scraped bookshelf: ${cache.books.length} books.`);
+
+    // Free the memory; the saved session makes the next launch cheap.
+    await closeBrowser();
     return cache;
 }
 
@@ -170,7 +236,7 @@ app.get('/getbooks', async (req, res) => {
         res.json({ books: data.books });
     } catch (err) {
         console.error(err);
-        isLoggedIn = false; // force re-login on next request
+        await closeBrowser(); // reset so next request starts clean
         res.status(500).json({ error: err.message });
     }
 });
@@ -192,7 +258,7 @@ app.get('/getlink', async (req, res) => {
         res.json({ link });
     } catch (err) {
         console.error(err);
-        isLoggedIn = false;
+        await closeBrowser();
         res.status(500).json({ error: err.message });
     }
 });

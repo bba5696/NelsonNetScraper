@@ -7,6 +7,8 @@ A small Node.js service that logs into a [NelsonNet](https://nelsondigital.cenga
 - The HTTP server starts **immediately** (ready in ~0.5s).
 - Logging in with a headless browser is **lazy** — it only happens the first time data is actually needed, or as a non-blocking background warm-up on boot.
 - The scraped bookshelf is cached to `cache.json`, so warm restarts answer in a few milliseconds **without launching the browser at all**. The book list is cached for 6 hours (titles rarely change), but the ebook **links are tokens that expire after about an hour**, so they're treated as stale after 30 minutes and re-scraped on demand.
+- The **login session is saved** to `session.json` and reused across restarts, so a restart skips the slow email/password/SSO login and goes straight to scraping (~2s). It only logs in fresh when the saved session has expired (~6s).
+- The browser is **launched only when a scrape is needed and closed right afterwards**, so the process idles at ~60 MB instead of keeping headless Chromium (~700 MB) resident. It runs comfortably on a 1 GB server.
 
 ## Setup
 
