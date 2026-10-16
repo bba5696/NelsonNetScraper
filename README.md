@@ -6,7 +6,7 @@ A small Node.js service that logs into a [NelsonNet](https://nelsondigital.cenga
 
 - The HTTP server starts **immediately** (ready in ~0.5s).
 - Logging in with a headless browser is **lazy** — it only happens the first time data is actually needed, or as a non-blocking background warm-up on boot.
-- The scraped bookshelf (books + ebook links) is cached to `cache.json` for 6 hours, so warm restarts answer in a few milliseconds **without launching the browser at all**.
+- The scraped bookshelf is cached to `cache.json`, so warm restarts answer in a few milliseconds **without launching the browser at all**. The book list is cached for 6 hours (titles rarely change), but the ebook **links are tokens that expire after about an hour**, so they're treated as stale after 30 minutes and re-scraped on demand.
 
 ## Setup
 
@@ -22,8 +22,9 @@ A small Node.js service that logs into a [NelsonNet](https://nelsondigital.cenga
    ```
    Optional:
    ```
-   PORT=3001            # HTTP port (default 3001)
-   CACHE_TTL_MS=21600000 # cache lifetime in ms (default 6 hours)
+   PORT=3001             # HTTP port (default 3001)
+   BOOKS_TTL_MS=21600000 # book-list cache lifetime in ms (default 6 hours)
+   LINKS_TTL_MS=1800000  # link cache lifetime in ms (default 30 min; links expire ~1h)
    ```
 3. Start it:
    ```bash

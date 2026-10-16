@@ -11,9 +11,12 @@ const EMAIL = process.env.NELSON_EMAIL;
 const PASSWORD = process.env.NELSON_PASSWORD;
 const API_KEY = process.env.API_KEY;
 
-// Bookshelf rarely changes, so cache it to disk and only re-scrape when stale.
+// Bookshelf is cached to disk so we only re-scrape when stale. Two TTLs:
+// the book LIST barely changes, but the ebook LINKS are tokens that expire
+// ~1h, so they get a much shorter lifetime (stay well under the hour).
 const CACHE_FILE = path.join(__dirname, 'cache.json');
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 1000 * 60 * 60 * 6; // 6 hours
+const BOOKS_TTL_MS = Number(process.env.BOOKS_TTL_MS) || 1000 * 60 * 60 * 6; // 6 hours
+const LINKS_TTL_MS = Number(process.env.LINKS_TTL_MS) || 1000 * 60 * 30;     // 30 minutes
 
 let browser = null;
 let page = null;
@@ -43,8 +46,8 @@ function saveCache() {
     }
 }
 
-function cacheIsFresh() {
-    return cache && (Date.now() - cache.timestamp) < CACHE_TTL_MS;
+function cacheAge() {
+    return cache ? Date.now() - cache.timestamp : Infinity;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,9 +139,11 @@ async function scrapeBookshelf() {
     return cache;
 }
 
-// Return cached data if fresh, otherwise scrape (deduping concurrent scrapes).
-function getData({ force = false } = {}) {
-    if (!force && cacheIsFresh()) return Promise.resolve(cache);
+// Return cached data if it's fresh enough for the caller's needs (ttl),
+// otherwise scrape (deduping concurrent scrapes). /getlink passes the short
+// links TTL; /getbooks passes the long book-list TTL.
+function getData({ force = false, ttl = LINKS_TTL_MS } = {}) {
+    if (!force && cacheAge() < ttl) return Promise.resolve(cache);
     if (!refreshPromise) {
         refreshPromise = scrapeBookshelf().finally(() => { refreshPromise = null; });
     }
@@ -161,7 +166,7 @@ app.get('/getbooks', async (req, res) => {
     if (!authCheck(req, res)) return;
 
     try {
-        const data = await getData({ force: req.query.refresh === '1' });
+        const data = await getData({ force: req.query.refresh === '1', ttl: BOOKS_TTL_MS });
         res.json({ books: data.books });
     } catch (err) {
         console.error(err);
@@ -177,7 +182,7 @@ app.get('/getlink', async (req, res) => {
     const index = parseInt(req.query.index ?? 0);
 
     try {
-        const data = await getData({ force: req.query.refresh === '1' });
+        const data = await getData({ force: req.query.refresh === '1', ttl: LINKS_TTL_MS });
         const link = data.links[index] ?? null;
 
         if (!link) {
@@ -198,7 +203,8 @@ app.get('/getlink', async (req, res) => {
 loadCache();
 app.listen(PORT, () => {
     console.log(`Scraper running on port ${PORT}`);
-    if (cacheIsFresh()) {
+    // Keep links fresh: warm up if the cache is older than the links TTL.
+    if (cacheAge() < LINKS_TTL_MS) {
         console.log('Serving from fresh cache; browser launches only on demand.');
     } else {
         console.log('Cache missing or stale — warming up in background...');
