@@ -57,3 +57,11 @@ curl -H "x-api-key: YOUR_API_KEY" "http://localhost:3001/getbooks?refresh=1"
 | `GET /getlink?index=N` | Returns `{ link }` for the ebook at index `N` |
 
 > **Note:** `index` in `/getbooks` is a book's position in the bookshelf; the `index` passed to `/getlink` selects from the list of ebook links. They are not always the same number.
+
+## Disclaimer
+
+For personal and educational use. It automates access to a NelsonNet account you already own, using credentials you supply — it does not bypass any paywall or authentication.
+
+## License
+
+[MIT](LICENSE)
